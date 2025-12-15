@@ -1,12 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=mpi_mat_batch
-#SBATCH --partition=batch          # <== NOT testing
+#SBATCH --partition=rome          # <== NOT testing
 #SBATCH --nodes=2                  # 2 nodes
-#SBATCH --ntasks-per-node=2        # 2 MPI ranks per node (total 4)
-#SBATCH --cpus-per-task=2          # 2 OpenMP threads per rank
+#SBATCH --ntasks-per-node=1        # 2 MPI ranks per node (total 4)
+#SBATCH --cpus-per-task=32          # 2 OpenMP threads per rank
 #SBATCH --time=00:01:00
 #SBATCH --output=OUT_%j.out
-#SBATCH --error=ERR_%j.err
+#SBATCH --error=ERR.err
 
 module purge
 module load gcc/9.2.0 openmpi/3.1.3
@@ -15,7 +15,7 @@ export MATIO_ROOT=/mnt/apps/aristotle/site/linux-centos7-x86_64/gcc-9.4.0/matio-
 export HDF5_ROOT=/mnt/apps/aristotle/site/linux-centos7-x86_64/gcc-9.4.0/hdf5-1.14.3-swov2l62sfp7i3k76j2wqxtsqgbwyu53
 
 echo "== Compiling =="
-mpic++ -O2 -fopenmp mpi_mat_prog.cpp helper_functions.cpp \
+mpic++ -O2 -fopenmp mpi_balance.cpp helper_functions.cpp \
   -I$MATIO_ROOT/include \
   -I$HDF5_ROOT/include \
   -L$MATIO_ROOT/lib \
@@ -27,11 +27,11 @@ echo "== Running =="
 export LD_LIBRARY_PATH=$MATIO_ROOT/lib:$HDF5_ROOT/lib:$LD_LIBRARY_PATH
 export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
 
-MAT_FILE=roadNet-CA.mat
+MAT_FILE=mawi_201512020330.mat
 
 echo "Running on host: $(hostname)"
 echo "NODES=$SLURM_JOB_NUM_NODES, NTASKS=$SLURM_NTASKS, OMP_THREADS=$OMP_NUM_THREADS"
 
-mpiexec -np ${SLURM_NTASKS} ./mpi_mat_prog "$MAT_FILE" Problem A
+mpiexec -np ${SLURM_NTASKS} ./mpi_mat_prog "$MAT_FILE" Problem A 2
 
 echo "== Done =="

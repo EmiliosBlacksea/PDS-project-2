@@ -1,0 +1,190 @@
+\documentclass[conference]{IEEEtran}
+
+\usepackage[main=english, greek]{babel}
+\usepackage{graphicx}
+\usepackage{float}
+\usepackage{amsmath}
+\usepackage{placeins}   % for \FloatBarrier
+\usepackage{dblfloatfix}
+
+\IEEEoverridecommandlockouts
+
+\begin{document}
+
+
+\title{PDS Project 2}
+
+\author{
+  \IEEEauthorblockN{\foreignlanguage{greek}{ΑΙΜΙΛΙΟΣ ΜΑΥΡΟΘΑΛΑΣΣΙΤΗΣ}}
+  \IEEEauthorblockA{%
+    \foreignlanguage{greek}{ΑΠΘ}\\
+    amavroth@ece.auth.gr\\
+    \foreignlanguage{greek}{ΑΕΜ : 10983}%
+  }
+}
+
+\maketitle
+
+\begin{abstract}
+	We extend a shared-memory OpenMP implementation for iterative graph processing to a distributed-memory MPI environment, targeting large sparse graphs that do not fit in a single node’s memory. Starting from an OpenMP baseline, we introduce row-wise matrix partitioning across MPI ranks, hybrid MPI+OpenMP parallelism, and global label synchronization using collective communication. The implementation is evaluated on the Aristotelis high-performance computing cluster using the Slurm workload manager. We study the impact of node count and synchronization frequency on performance, focusing on runtime, convergence behavior, and scaling efficiency. Experimental results on a real-world network dataset show that frequent global synchronization yields the best performance, while increasing the number of nodes beyond a small scale provides limited benefit due to communication and synchronization overheads. These findings highlight the practical trade-offs between computation and communication in hybrid MPI+OpenMP graph algorithms.
+\end{abstract}
+
+
+\section{From OpenMP baseline to MPI (and how we ran it on Slurm)}
+
+\subsection{Baseline (Phase 1): shared-memory OpenMP code}
+Our starting point was a single-node OpenMP implementation that processes a sparse adjacency matrix loaded from a MATLAB \texttt{.mat} file. The algorithm follows an iterative label-propagation scheme and terminates when no labels change.
+
+Parallelism is applied over matrix rows using \texttt{\#pragma omp parallel for}, with a reduction on a global \texttt{changed} flag to detect convergence. This OpenMP version serves as the correctness baseline and single-node performance reference for the distributed-memory experiments.
+
+
+\subsection{Phase 2: distributed-memory MPI extension}
+In Phase 2 we extended the baseline to run on distributed memory using MPI
+The goal was to handle graphs that do not comfortably fit in one node’s memory, and to scale computation across multiple nodes.
+
+The main changes compared to the OpenMP version were:
+
+\paragraph{MPI initialization and rank roles}
+We added standard MPI startup (\texttt{MPI\_Init}), retrieved \texttt{world\_size} and \texttt{world\_rank}, and ensured only rank 0 prints usage/errors (to avoid duplicated output).
+
+\paragraph{Matrix loading + distribution}
+Rank 0 loads the sparse matrix from the \texttt{.mat} file and extracts the CSC arrays. Then:
+\begin{itemize}
+	\item Dimensions (\texttt{nrows, ncols, nnz}) are broadcast to all ranks with \texttt{MPI\_Bcast}.
+	\item Rows are partitioned across ranks using a block distribution with remainder handling (nearly equal chunk sizes).
+	\item Rank 0 sends each rank its local row-pointer segment and corresponding column-index slice (via \texttt{MPI\_Send}); other ranks receive them (\texttt{MPI\_Recv}) and locally rebase row pointers so indexing starts from 0.
+\end{itemize}
+
+\paragraph{Hybrid parallelism: MPI + OpenMP}
+Inside each MPI rank we keep OpenMP parallelism on the local row range:
+\begin{itemize}
+	\item The local update step parallelizes over local rows.
+	\item Each local row maps to a global row index (\texttt{global\_row = row\_start + local\_row}).
+\end{itemize}
+
+\paragraph{Global label consistency (synchronization)}
+For simplicity and correctness, we kept a full label array \texttt{A\_l} on every rank (same global indexing).
+After a batch of local updates, all ranks synchronize labels using:
+\[
+\texttt{MPI\_Allreduce(A\_l, MPI\_MIN)}
+\]
+This effectively propagates the best (minimum) label information globally.
+
+\paragraph{K-sync optimization knob}
+To reduce communication overhead, we introduced \texttt{K\_sync}: instead of synchronizing after every local iteration, each rank performs up to \texttt{K\_sync} local iterations before calling \texttt{MPI\_Allreduce}. 
+This provides a simple trade-off:
+\begin{itemize}
+	\item small \texttt{K\_sync} $\Rightarrow$ more frequent synchronization (more communication, potentially fewer outer rounds),
+	\item large \texttt{K\_sync} $\Rightarrow$ fewer synchronizations (less communication, but potentially more stale information between ranks)
+	\item Or at least we thought so. We coulnt show that larger K offers fewer out rounds but we are confident that if we could run the tests in a larger amount of nodes we would be able to provide a graph of this relationship.
+\end{itemize}
+
+Convergence is checked once per outer synchronization step using an \texttt{MPI\_Allreduce} logical-or over a local ``changed'' flag. Rank 0 reports total runtime and number of connected components (via the number of distinct final labels).
+
+\subsection{Running on Aristotelis with Slurm (final test script)}
+For the final set of tests we used the following Slurm setup (Rome partition), compiling on-the-fly and then running with \texttt{mpiexec}.
+
+\paragraph{Where we change nodes / MPI ranks / threads}
+The resource scaling knobs are all in the \texttt{\#SBATCH} header:
+
+\begin{itemize}
+	\item \textbf{Nodes:} \texttt{\#SBATCH --nodes=2}.  
+	This is the main control for multi-node scaling (we change this to 1, 2, 4, \dots depending on the experiment).
+	\item \textbf{MPI ranks per node:} \texttt{\#SBATCH --ntasks-per-node=1}.  
+	Total MPI ranks become \texttt{SLURM\_NTASKS = nodes $\times$ ntasks-per-node}. If we want more ranks per node, we increase this value.
+	\item \textbf{OpenMP threads per rank:} \texttt{\#SBATCH --cpus-per-task=32}.  
+	We bind OpenMP to exactly the requested cores using:
+	\[
+	\begin{aligned}
+	&\text{export OMP\_NUM\_THREADS=} \\
+	&\text{\$SLURM\_CPUS\_PER\_TASK}
+	\end{aligned}
+	\]
+	So changing \texttt{--cpus-per-task} directly changes the number of threads each MPI rank uses.
+\end{itemize}
+
+\paragraph{Partition and time limits}
+We ran on \texttt{--partition=rome} and set a short wall time (\texttt{--time=00:01:00}) for quick iteration during testing.
+
+\paragraph{Compilation step inside the job}
+Inside the script we compile with OpenMP + MPI enabled:
+\[
+\texttt{mpic++ -O2 -fopenmp ... -lmatio -lhdf5}
+\]
+We explicitly point include/library paths using \texttt{MATIO\_ROOT} and \texttt{HDF5\_ROOT}, then set
+\texttt{LD\_LIBRARY\_PATH} so the executable can find the shared libraries at runtime.
+
+\paragraph{Runtime parameters and reporting}
+We print basic runtime context:
+\texttt{hostname}, \texttt{NODES=\$SLURM\_JOB\_NUM\_NODES}, \texttt{NTASKS=\$SLURM\_NTASKS}, and \texttt{OMP\_THREADS=\$OMP\_NUM\_THREADS},
+then run:
+\[
+\begin{aligned}
+&\texttt{mpiexec -np \$SLURM\_NTASKS} \\
+&\texttt{./mpi\_mat\_prog MAT\_FILE  Problem A 2}
+\end{aligned}
+\]
+In our case the input file was \texttt{mawi\_201512020330.mat} and the last argument (\texttt{2}) was the chosen synchronization frequency parameter for the MPI algorithm (our \texttt{K\_sync} in the report).
+
+\paragraph{What this specific configuration means (the one we used)}
+With \texttt{--nodes=2} and \texttt{--ntasks-per-node=1}, the job runs with \textbf{2 MPI ranks total} (one rank on each node).  
+With \texttt{--cpus-per-task=32} and \texttt{OMP\_NUM\_THREADS=\$SLURM\_CPUS\_PER\_TASK}, each MPI rank uses \textbf{32 OpenMP threads}.  
+So overall the job uses \textbf{2 ranks $\times$ 32 threads = 64 CPU threads} across the two nodes.
+
+\section{Results}
+This section summarizes the performance sweep extracted from our results table (runtime in seconds and number of outer synchronization rounds). Unless stated otherwise, runs use \texttt{OMP\_THREADS=128} and one MPI rank per node (so \texttt{NTASKS=NODES}). We varied the number of nodes (1--7) and the synchronization frequency parameter \texttt{K\_sync} (1--5).
+
+\paragraph{Heatmap overview (Fig.~\ref{fig:heatmap_runtime_nodes_vs_K}).}
+\FloatBarrier
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\columnwidth]{heatmap_runtime_nodes_vs_K.png}
+	\caption{Runtime heatmap vs nodes and \texttt{K\_sync} (\texttt{OMP\_THREADS}=128).}
+	\label{fig:heatmap_runtime_nodes_vs_K}
+\end{figure}
+The heatmap highlights a very clear global trend: for every multi-node configuration tested, \textbf{\texttt{K\_sync}=1 gives the lowest runtime}. Increasing \texttt{K\_sync} always increases runtime, meaning that in this workload the extra local work between synchronizations does not translate into faster overall convergence. The 2-node row is also a visible outlier, showing substantially higher runtimes than the rest of the sweep, especially for larger \texttt{K\_sync}.
+
+\paragraph{Convergence in outer rounds (Fig.~\ref{fig:outer_rounds_vs_Ksync_by_nodes}).}
+\FloatBarrier
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\columnwidth]{outer_rounds_vs_Ksync_by_nodes.png}
+	\caption{Outer synchronization rounds vs \texttt{K\_sync} (\texttt{OMP\_THREADS}=128).}
+	\label{fig:outer_rounds_vs_Ksync_by_nodes}
+\end{figure}
+(3-5-7 nodes all do 14 outer rounds and 2-4-6 all do 15 outer rounds)The outer-rounds plot explains why larger \texttt{K\_sync} performs poorly: for each fixed node count, the number of outer synchronization rounds is \textbf{constant across \texttt{K\_sync}}. In our data, the 1-node run converged in \textbf{9} outer rounds (we only measured \texttt{K\_sync}=1 for 1 node), while all multi-node runs required either \textbf{14 rounds} (3/5/7 nodes) or \textbf{15 rounds} (2/4/6 nodes), independent of \texttt{K\_sync}. Therefore, increasing \texttt{K\_sync} does \emph{not} reduce the number of expensive global synchronization steps; it mostly adds additional redundant computation between them.
+
+\paragraph{Runtime vs \texttt{K\_sync} (Fig.~\ref{fig:runtime_vs_Ksync_by_nodes}).}
+\FloatBarrier
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\columnwidth]{runtime_vs_Ksync_by_nodes.png}
+	\caption{Runtime vs \texttt{K\_sync} for different node counts (\texttt{OMP\_THREADS}=128).}
+	\label{fig:runtime_vs_Ksync_by_nodes}
+\end{figure}
+The per-node curves show a near-monotonic runtime increase as \texttt{K\_sync} grows. The slowdown from \texttt{K\_sync}=1 to \texttt{K\_sync}=5 is significant: for nodes 3--7 it is about \textbf{1.57$\times$--1.78$\times$} (e.g., 3 nodes: 7.05s $\rightarrow$ 12.12s; 4 nodes: 8.28s $\rightarrow$ 14.73s), while for 2 nodes it is even worse at about \textbf{2.22$\times$} (11.57s $\rightarrow$ 25.73s). Practically, the best setting in this sweep is always the smallest tested value, \textbf{\texttt{K\_sync}=1}.
+
+\paragraph{Scaling with nodes (Fig.~\ref{fig:scaling_runtime_vs_nodes}).}
+\FloatBarrier
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\columnwidth]{scaling_runtime_vs_nodes.png}
+	\caption{Scaling: runtime vs nodes for selected \texttt{K\_sync} values (\texttt{OMP\_THREADS}=128).}
+	\label{fig:scaling_runtime_vs_nodes}
+\end{figure}
+Strong-scaling behavior is limited: runtime does not keep decreasing as nodes increase. For \texttt{K\_sync}=1, the baseline 1-node runtime is \textbf{7.19s}. The best observed runtime overall is \textbf{7.05s} at \textbf{3 nodes} (only about \textbf{2\%} faster than 1 node). Beyond 3 nodes, runtimes rise and then plateau around \textbf{8--9s} (e.g., 7 nodes: 8.56s, which is \textbf{$\sim$19\% slower} than 1 node). The 2-node point is an anomaly (11.57s), far worse than both 1 and 3 nodes; this suggests that at small node counts the run-to-run system effects and/or communication overhead can dominate and produce non-monotonic scaling.
+
+\paragraph{Speedup and efficiency for \texttt{K\_sync}=1 (Fig.~\ref{fig:speedup_efficiency_K1}).}
+\FloatBarrier
+\begin{figure}[H]
+	\centering
+	\includegraphics[width=\columnwidth]{speedup_efficiency_K1.png}
+	\caption{Speedup and efficiency vs nodes for \texttt{K\_sync}=1 (\texttt{OMP\_THREADS}=128).}
+	\label{fig:speedup_efficiency_K1}
+\end{figure}
+Using the 1-node, \texttt{K\_sync}=1 time (7.19s) as the reference, speedup is mostly \textbf{below 1} (i.e., slowdown) except at 3 nodes. Specifically: 2 nodes achieve speedup \textbf{0.62} (efficiency \textbf{0.31}), 3 nodes achieve the best speedup \textbf{1.02} (efficiency \textbf{0.34}), and by 7 nodes speedup drops to \textbf{0.84} (efficiency \textbf{0.12}). This pattern indicates that the implementation is limited by synchronization/communication costs (global coordination each outer step), so the benefits of distributing the local work are quickly outweighed as node count grows, especially since each rank is already heavily threaded (\texttt{OMP\_THREADS=128}).
+
+\paragraph{Main takeaway.}
+For this dataset and the tested configuration, the best-performing region is \textbf{small \texttt{K\_sync} (1)} and a modest node count (best observed at \textbf{3 nodes}). Larger \texttt{K\_sync} consistently increases runtime without improving the number of outer rounds, and scaling beyond 3 nodes yields diminishing returns or slowdown, consistent with synchronization/communication dominating the overall cost.
+
+\end{document}
